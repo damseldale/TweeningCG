@@ -1,52 +1,45 @@
 #pragma once
 #include "../Memory/ArenaAllocator.h"
 #include "../Data_Structure/TransformSoA.h"
+#include "../Data_Structure/EntityMasks.h"
 #include "../Systems/TweenMutator.h"
 #include <cstdint>
 
 namespace NexusTween {
 namespace API {
 
-// Handle generik yang sangat ringan (4 byte).
-// Pengguna hanya akan memegang struct ini, BUKAN pointer ke data.
 struct TweenHandle {
     uint32_t id;
-    // Di masa depan, kita bisa menambahkan bit generasi (generation bit) 
-    // di sini untuk mencegah bug penggunaan ulang ID.
 };
 
-// [REVOLUSI ANTARMUKA]: NexusEngine menyembunyikan brutalitas Data-Oriented Design 
-// di balik fasad yang elegan, deterministik, dan bebas alokasi dinamis.
+// [REVOLUSI ANTARMUKA]: Pintu gerbang utama. Pengguna tidak pernah melihat 
+// pointer memori, hanya memegang 'Handle' (ID) ringan.
 class NexusEngine {
 private:
     Memory::ArenaAllocator arena;
     DataStructure::TransformSoA transforms;
+    DataStructure::EntityMasks masks; // Injeksi Bit-Matrix kita
     bool isBooted;
 
 public:
     NexusEngine() : isBooted(false) {}
 
-    // 1. IGNITION (Menyalakan Mesin)
-    // Pengguna harus secara eksplisit mendeklarasikan batas maksimal (Max Capacity).
-    // Ini memaksa disiplin memori dan mencegah kebocoran secara arsitektural.
+    // IGNITION
     void Boot(size_t maxEntities) {
         if (isBooted) return;
 
-        // Kalkulasi kasar memori yang dibutuhkan:
-        // 10 Array (X,Y,Z untuk Current, Start, Target + 1 Array Waktu)
-        // Setiap array berukuran = maxEntities * 4 byte (ukuran float)
-        size_t bytesNeeded = 10 * maxEntities * sizeof(float);
-        
-        // Tambahkan padding ekstra untuk keamanan alignment 32-byte
-        bytesNeeded += 1024; 
+        // Kalkulasi kasar memori: 10 Array SoA + Array Bit-Masks
+        size_t bytesNeeded = (10 * maxEntities * sizeof(float)) + 
+                             ((maxEntities + 31) / 32 * sizeof(uint32_t)) + 1024; 
 
         arena.Initialize(bytesNeeded);
         transforms.Initialize(arena, maxEntities);
+        masks.Initialize(arena, maxEntities); // Inisialisasi Masks
+        
         isBooted = true;
     }
 
-    // 2. INJECTION (Menambahkan Animasi)
-    // Antarmuka yang mulus. Mengembalikan 'Handle', bukan referensi objek.
+    // INJECTION
     TweenHandle Animate(float startX, float startY, float startZ, 
                         float targetX, float targetY, float targetZ) {
         
@@ -55,23 +48,34 @@ public:
         size_t internalIndex = transforms.AddTween(startX, startY, startZ, 
                                                    targetX, targetY, targetZ);
         
+        if (internalIndex != static_cast<size_t>(-1)) {
+            masks.Play(internalIndex); // Nyalakan bit agar animasi berjalan
+        }
+        
         return { static_cast<uint32_t>(internalIndex) };
     }
 
-    // 3. EXECUTION (Siklus Detak Jam / Frame Loop)
-    // Dipanggil setiap frame (misal di dalam Unity, Unreal, atau custom game loop).
-    // Meneruskan waktu linear ke jantung mutator.
-    void Tick(float deltaTime) {
-        if (!isBooted) return;
-        Systems::TweenMutator::Mutate(transforms, deltaTime);
+    // [KENDALI INSTAN O(1)]: Mengubah bit tunggal tanpa percabangan
+    void Pause(TweenHandle handle) {
+        if (!isBooted || handle.id >= transforms.activeCount) return;
+        masks.Pause(handle.id);
     }
 
-    // 4. DATA RETRIEVAL (Membaca Hasil)
-    // Pengguna menggunakan Handle untuk menarik data dari SoA tanpa menyentuh strukturnya langsung.
-    // Eksekusi O(1) mutlak melalui pembacaan array.
+    void Resume(TweenHandle handle) {
+        if (!isBooted || handle.id >= transforms.activeCount) return;
+        masks.Play(handle.id);
+    }
+
+    // EXECUTION
+    void Tick(float deltaTime) {
+        if (!isBooted) return;
+        // Mutator kini menelan matriks data dan matriks bit secara bersamaan
+        Systems::TweenMutator::Mutate(transforms, masks, deltaTime);
+    }
+
+    // DATA RETRIEVAL
     void GetCurrentPosition(TweenHandle handle, float& outX, float& outY, float& outZ) const {
         if (handle.id >= transforms.activeCount) {
-            // Handle kedaluwarsa atau salah, berikan posisi 0 sebagai pertahanan (fail-safe)
             outX = outY = outZ = 0.0f; 
             return;
         }
@@ -81,7 +85,7 @@ public:
         outZ = transforms.currentZ[handle.id];
     }
 
-    // 5. TERMINATION (Mematikan Mesin)
+    // TERMINATION
     void Shutdown() {
         if (!isBooted) return;
         arena.Shutdown();
