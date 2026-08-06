@@ -1,61 +1,65 @@
-
 #include "TweenMutator.h"
 #include "../Mathematics/SplineCore.h"
+#include "../Data_Structure/EntityMasks.h" // Modul bit-masking kita
 
 namespace NexusTween {
 namespace Systems {
 
-void TweenMutator::Mutate(DataStructure::TransformSoA& soa, float deltaTime) {
-    if (soa.activeCount == 0) return; // Zero-cost idle jika tidak ada yang perlu dianimasikan.
+// Mutator berevolusi menerima referensi matriks bit (Masks)
+void TweenMutator::Mutate(DataStructure::TransformSoA& soa, DataStructure::EntityMasks& masks, float deltaTime) {
+    if (soa.activeCount == 0) return;
 
     // =====================================================================
-    // PASS 1: MATEMATIKA VEKTOR (SIMD-FRIENDLY PIPELINE)
+    // PASS 1: MATEMATIKA VEKTOR (SIMD-FRIENDLY & BRANCHLESS)
     // =====================================================================
-    // Perulangan ini 100% deterministik dan bebas percabangan (branchless).
-    // Compiler akan membongkar perulangan ini (loop unrolling) dan 
-    // memproses X, Y, Z secara simultan.
     for (size_t i = 0; i < soa.activeCount; ++i) {
-        // 1. Majukan Waktu Linear
-        // (Asumsi durasi universal 1.0 demi kesederhanaan. Dalam praktiknya, 
-        // kita bisa menambahkan array soa.durationT[i]).
-        float rawT = soa.timeT[i] + deltaTime;
+        
+        // [BIT-MASKING INJEKSI]: Menarik status dari matriks bit yang dipadatkan (O(1))
+        uint32_t stateBit = masks.GetState(i);
+        
+        // Konversi bit ke multiplier (1.0f untuk Play, 0.0f untuk Pause)
+        float timeMultiplier = static_cast<float>(stateBit);
+
+        // Majukan Waktu Linear secara determenistik.
+        // Jika animasi dipause (multiplier 0.0), waktu terhenti tanpa memicu cache-miss if/else.
+        float rawT = soa.timeT[i] + (deltaTime * timeMultiplier);
         soa.timeT[i] = rawT;
 
-        // 2. Klem Nilai Waktu (Clamp) tanpa instruksi If
-        // Matematika murni untuk membatasi t pada maksimum 1.0f.
+        // Matematika murni untuk klem nilai (0.0 ke 1.0)
         float clampedT = rawT > 1.0f ? 1.0f : rawT;
 
-        // 3. Modulasi Kurva (Easing)
-        // Transformasi waktu linear menjadi kurva transisi mulus menggunakan 
-        // Evaluasi Bezier Kubik yang kita rancang sebelumnya.
-        float easedT = Mathematics::SplineCore::EvaluateCubicBezierEasing(clampedT, 0.0f, 1.0f);
+        // [REVOLUSI FISIKA]: 
+        // Menggunakan evaluasi Spring murni tanpa pustaka Math.
+        // Asumsi nilai tension = 120.0f, friction = 12.0f (bisa ditarik dari array SoA nantinya)
+        float springT = Mathematics::SplineCore::EvaluateSpring(clampedT, 120.0f, 12.0f);
 
-        // 4. Interpolasi Posisi (Lerp)
-        // Menarik data dari Array Start, memproyeksikannya ke Array Target.
-        // Karena data sejajar di RAM, CPU prefetcher akan menarik blok memori berikutnya 
-        // bahkan sebelum perhitungan ini selesai.
-        soa.currentX[i] = Mathematics::SplineCore::Lerp(soa.startX[i], soa.targetX[i], easedT);
-        soa.currentY[i] = Mathematics::SplineCore::Lerp(soa.startY[i], soa.targetY[i], easedT);
-        soa.currentZ[i] = Mathematics::SplineCore::Lerp(soa.startZ[i], soa.targetZ[i], easedT);
+        // Interpolasi Posisi ditarik ke dalam cache L1 secara berurutan
+        soa.currentX[i] = Mathematics::SplineCore::Lerp(soa.startX[i], soa.targetX[i], springT);
+        soa.currentY[i] = Mathematics::SplineCore::Lerp(soa.startY[i], soa.targetY[i], springT);
+        soa.currentZ[i] = Mathematics::SplineCore::Lerp(soa.startZ[i], soa.targetZ[i], springT);
     }
 
     // =====================================================================
-    // PASS 2: PEMUSNAHAN ENTITAS (THE REAPER)
+    // PASS 2: THE REAPER (PEMUSNAHAN O(1) MUTLAK)
     // =====================================================================
-    // Memindai memori untuk animasi yang telah selesai (t >= 1.0).
-    // Eksekusi ini terpisah agar tidak mengganggu kecepatan kalkulasi matematika di Pass 1.
     size_t currentIndex = 0;
     while (currentIndex < soa.activeCount) {
         if (soa.timeT[currentIndex] >= 1.0f) {
-            // Mekanisme Swap-and-Pop: O(1) Instan.
+            
+            // Hancurkan data animasi dari RAM
             soa.RemoveTween(currentIndex);
             
-            // PENTING: Kita tidak menambah (increment) currentIndex di sini.
-            // Mengapa? Karena entitas dari akhir array baru saja ditukar (swap) 
-            // ke posisi currentIndex. Kita harus memeriksa entitas baru ini 
-            // di putaran iterasi berikutnya.
+            // [SINKRONISASI BIT]: Karena entitas terakhir dipindahkan ke currentIndex 
+            // (Swap and Pop), kita harus menyalin status bit-nya juga agar tidak terjadi korupsi status.
+            size_t lastIndex = soa.activeCount; // Nilai sudah dikurangi oleh RemoveTween()
+            
+            if (masks.GetState(lastIndex) == 1) {
+                masks.Play(currentIndex);
+            } else {
+                masks.Pause(currentIndex);
+            }
+            
         } else {
-            // Jika belum selesai, lanjut ke entitas berikutnya.
             currentIndex++;
         }
     }
